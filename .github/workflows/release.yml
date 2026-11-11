@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_version:
+        description: Tailscale 稳定版版本号；留空使用官方最新稳定版
+        required: false
+        type: string
+      dockerhub_repository:
+        description: Docker Hub 仓库；留空使用仓库变量或 goalonez/z-tailscale-derp
+        required: false
+        type: string
+      update_latest:
+        description: 同时更新 Docker Hub latest 和 GitHub 最新发布
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: derper-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      tailscale_version: ${{ steps.prepare.outputs.tailscale_version }}
+      tailscale_revision: ${{ steps.prepare.outputs.tailscale_revision }}
+      dockerhub_repository: ${{ steps.prepare.outputs.dockerhub_repository }}
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 检查脚本语法
+        run: for script in scripts/*.sh; do bash -n "$script"; done
+      - name: 检查发布凭证
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo '请配置 DOCKERHUB_USERNAME 和 DOCKERHUB_TOKEN Secrets。' >&2
+            exit 1
+          fi
+      - name: 锁定版本和发布目标
+        id: prepare
+        env:
+          INPUT_VERSION: ${{ inputs.tailscale_version }}
+          INPUT_REPOSITORY: ${{ inputs.dockerhub_repository }}
+          DEFAULT_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+          UPDATE_LATEST: ${{ inputs.update_latest }}
+        run: |
+          set -euo pipefail
+          metadata="$(bash scripts/resolve-version.sh "$INPUT_VERSION")"
+          printf '%s\n' "$metadata" >> "$GITHUB_OUTPUT"
+          version="$(printf '%s\n' "$metadata" | awk -F= '$1 == "tailscale_version" { print $2 }')"
+          repository="${INPUT_REPOSITORY:-${DEFAULT_REPOSITORY:-goalonez/z-tailscale-derp}}"
+          if [[ ! "$repository" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+            echo 'Docker Hub 仓库格式应为小写的 namespace/repository。' >&2
+            exit 1
+          fi
+          printf 'dockerhub_repository=%s\n' "$repository" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<EOF'
+            printf '%s:%s\n' "$repository" "$version"
+            if [ "$UPDATE_LATEST" = true ]; then
+              printf '%s:latest\n' "$repository"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        id: buildx
+      - name: 构建并检查两个架构的离线包
+        env:
+          VERSION: ${{ steps.prepare.outputs.tailscale_version }}
+          UPSTREAM_REVISION: ${{ steps.prepare.outputs.tailscale_revision }}
+          GO_VERSION: ${{ steps.prepare.outputs.go_version }}
+          BUILD_REVISION: ${{ github.sha }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+          BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build_args=(
+            --build-arg "TAILSCALE_VERSION=$VERSION"
+            --build-arg "TAILSCALE_REVISION=$UPSTREAM_REVISION"
+            --build-arg "GO_VERSION=$GO_VERSION"
+            --build-arg "BUILD_REVISION=$BUILD_REVISION"
+            --build-arg "SOURCE_URL=$SOURCE_URL"
+          )
+          for arch in amd64 arm64; do
+            archive="dist/z-tailscale-derp_${VERSION}_linux-${arch}.tar"
+            docker buildx build --builder "$BUILDER" --platform "linux/$arch" \
+              "${build_args[@]}" --provenance=false \
+              --tag "z-tailscale-derp:$VERSION" --tag z-tailscale-derp:latest \
+              --output "type=docker,dest=$archive" .
+            docker load -i "$archive"
+            actual="$(docker run --rm --platform "linux/$arch" "z-tailscale-derp:$VERSION" --version)"
+            case "$actual" in
+              "$VERSION"|"$VERSION"-*) printf '%s\n' "$actual" ;;
+              *) echo "版本不匹配：$actual" >&2; exit 1 ;;
+            esac
+          done
+          (cd dist && sha256sum *.tar > SHA256SUMS)
+      - name: 登录 Docker Hub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: 发布多架构镜像
+        id: publish
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          builder: ${{ steps.buildx.outputs.name }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.prepare.outputs.tags }}
+          build-args: |
+            TAILSCALE_VERSION=${{ steps.prepare.outputs.tailscale_version }}
+            TAILSCALE_REVISION=${{ steps.prepare.outputs.tailscale_revision }}
+            GO_VERSION=${{ steps.prepare.outputs.go_version }}
+            BUILD_REVISION=${{ github.sha }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+      - name: 保存发布附件
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+      - name: 记录镜像 digest
+        env:
+          REPOSITORY: ${{ steps.prepare.outputs.dockerhub_repository }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: printf '%s\n' "镜像：$REPOSITORY@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-release:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-assets
+          path: dist
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build-and-push.outputs.tailscale_version }}
+          UPSTREAM_REVISION: ${{ needs.build-and-push.outputs.tailscale_revision }}
+          REPOSITORY: ${{ needs.build-and-push.outputs.dockerhub_repository }}
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          BUILD_REVISION: ${{ github.sha }}
+          UPDATE_LATEST: ${{ inputs.update_latest }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          printf '%s\n' \
+            "- Tailscale：v$VERSION（$UPSTREAM_REVISION）" \
+            "- 打包提交：$BUILD_REVISION" \
+            "- Docker Hub：$REPOSITORY:$VERSION" \
+            "- Digest：$DIGEST" \
+            "- 更新 latest：$UPDATE_LATEST" \
+            '- 附件：amd64 / arm64 离线包及 SHA256SUMS' \
+            '- 离线包标签：z-tailscale-derp:<版本> 和 z-tailscale-derp:latest' \
+            > release-notes.md
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/*.tar dist/SHA256SUMS --clobber
+            gh release edit "v$VERSION" --title "v$VERSION" --notes-file release-notes.md --latest="$UPDATE_LATEST"
+          else
+            gh release create "v$VERSION" dist/*.tar dist/SHA256SUMS \
+              --title "v$VERSION" --notes-file release-notes.md \
+              --target "$BUILD_REVISION" --latest="$UPDATE_LATEST"
+          fi
