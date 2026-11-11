@@ -22,103 +22,82 @@
 
 ## 快速部署
 
-### 方案 A：自动申请证书（推荐公网 80/443 端口开放的服务器）
-
-创建 `compose.yaml`：
+创建 `compose.yaml`，以下默认使用自有证书并开启客户端验证，两个服务通过共享 Socket 通信，其他用法按注释调整。Tailscale 示例适用于支持 `/dev/net/tun` 的 Linux 宿主机；已有可用的 Tailscale 时可复用，无需重复部署：
 
 ```yaml
 services:
-  derper:
-    image: goalonez/z-tailscale-derp:latest
-    container_name: derper
-    restart: unless-stopped
+  z-tailscale-derp:
+    image: goalonez/z-tailscale-derp:latest # 长期使用建议固定版本号
+    container_name: z-tailscale-derp
     ports:
-      - "80:80/tcp"
       - "443:443/tcp"
       - "3478:3478/udp"
-    command:
-      - --hostname=derp.example.com
-      - --c=/var/lib/derper/derper.key
-      - --certdir=/var/lib/derper/certs
+      # 使用 Let's Encrypt 自动证书时取消下一行注释，并开放宿主机 80/tcp
+      # - "80:80/tcp"
     volumes:
-      - ./data:/var/lib/derper
-```
-
-启动容器：
-```bash
-docker compose up -d
-```
-
-> **提示**：首次启动会自动向 Let's Encrypt 申请证书，并持久化保存在 `./data/certs` 目录中。
-
----
-
-### 方案 B：使用自有证书（国内云服务器或已有泛域名证书）
-
-如果 80 端口不可用，或者已有 SSL 证书（如 acme.sh 签发）：
-
-```yaml
-services:
-  derper:
-    image: goalonez/z-tailscale-derp:latest
-    container_name: derper
-    restart: unless-stopped
-    ports:
-      - "443:443/tcp"
-      - "3478:3478/udp"
+      # 持久化 DERP 配置及自动证书
+      - /docker/z-tailscale-derp:/var/lib/derper
+      # 自有证书：左侧替换为实际路径（可用泛域名证书），右侧文件名必须与 --hostname 匹配
+      # 证书需包含完整证书链；使用自动证书时移除以下两项挂载
+      - /docker/certs/derp.example.com.crt:/certs/derp.example.com.crt:ro
+      - /docker/certs/derp.example.com.key:/certs/derp.example.com.key:ro
+      # 客户端验证：与下方 tailscale 服务共享同一个宿主机目录（冒号左侧），DERP 侧只读挂载
+      # 不开启验证时移除此挂载及下方两个验证参数，也无需部署 tailscale 服务
+      - /var/run/tailscale:/var/run/tailscale:ro
     command:
       - --hostname=derp.example.com
       - --c=/var/lib/derper/derper.key
+      # 自有证书；自动证书改为 --certmode=letsencrypt
       - --certmode=manual
+      # 自动证书改为 --certdir=/var/lib/derper/certs，以持久化证书
       - --certdir=/certs
+      # 禁用 HTTP；自动证书时移除此行，恢复默认 80 端口
       - --http-port=-1
-    volumes:
-      - ./data:/var/lib/derper
-      # 挂载证书文件（宿主机按实际路径填写；容器内必须为 <hostname>.crt 和 <hostname>.key）
-      - ./certs/derp.example.com.crt:/certs/derp.example.com.crt:ro
-      - ./certs/derp.example.com.key:/certs/derp.example.com.key:ro
-```
-
-> **注意**：
-> 1. 宿主机证书文件名（冒号左侧）按实际路径填写（无论是 `.crt`、`fullchain.pem` 还是泛域名证书均可）；容器内文件名称（冒号右侧）必须严格为 `<hostname>.crt` 与 `<hostname>.key`。
-> 2. 证书必须是包含中间证书的完整证书链（fullchain），私钥需与域名匹配。
-> 3. 外部证书更新后，执行 `docker compose up -d --force-recreate` 重建容器以读取最新证书。
-
-## 进阶配置：客户端防蹭网验证（Verify Clients）
-
-默认情况下，DERP 服务器不限制客户端，任何知道该域名的人都可以使用你的服务器中继流量。
-
-如果你只希望**自己的 Tailnet 设备**使用该节点，可以开启客户端验证（**方案 A 和方案 B 均适用**，只需在原配置基础上追加对应参数）：
-
-1. 确保宿主机已安装并运行 `tailscaled`，且已登录到你的 Tailnet。
-2. 镜像版本建议与宿主机 `tailscaled` 版本保持一致（如 `goalonez/z-tailscale-derp:1.104.6`）。
-3. 在 `command` 中追加验证参数，并在 `volumes` 中挂载宿主机的 `tailscaled.sock`（以下以方案 B 为例）：
-
-```yaml
-services:
-  derper:
-    image: goalonez/z-tailscale-derp:latest # 建议固定为与宿主机 tailscaled 相同的版本号
-    container_name: derper
-    restart: unless-stopped
-    ports:
-      - "443:443/tcp"
-      - "3478:3478/udp"
-    command:
-      - --hostname=derp.example.com
-      - --c=/var/lib/derper/derper.key
-      - --certmode=manual
-      - --certdir=/certs
-      - --http-port=-1
-      # 启用客户端验证
+      # 仅允许自己的 Tailnet 设备使用；移除以下两项会开放中继给其他客户端
       - --verify-clients
       - --socket=/var/run/tailscale/tailscaled.sock
+    restart: unless-stopped
+
+  # 为 DERP 提供客户端验证；已有可用的 Tailscale 时可移除此服务，并调整上方 Socket 挂载
+  tailscale:
+    image: tailscale/tailscale:latest # 长期使用建议固定版本号
+    container_name: tailscale
+    network_mode: host
+    hostname: derp-server
     volumes:
-      - ./data:/var/lib/derper
-      - ./certs/derp.example.com.crt:/certs/derp.example.com.crt:ro
-      - ./certs/derp.example.com.key:/certs/derp.example.com.key:ro
-      # 挂载宿主机 Tailscale Socket
-      - /var/run/tailscale:/var/run/tailscale:ro
+      # 持久化登录状态
+      - /docker/tailscale:/var/lib/tailscale
+      # 与 DERP 共享同一个宿主机目录，Tailscale 在此创建 Socket，需可写
+      - /var/run/tailscale:/var/run/tailscale
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_USERSPACE=false
+      - TS_AUTH_ONCE=true
+      # 可选：通过环境变量传入 Auth Key 自动登录；不设置时按下方步骤打开登录链接
+      # - TS_AUTHKEY=${TS_AUTHKEY}
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - net_raw
+    restart: unless-stopped
 ```
+
+首次部署先启动 Tailscale，查看日志中的登录链接并登录自己的 Tailnet（已通过 Auth Key 登录可跳过手动登录）：
+
+```bash
+docker compose up -d tailscale
+docker compose logs tailscale
+```
+
+完成登录后启动 DERP；复用已有 Tailscale 时可直接执行：
+
+```bash
+docker compose up -d z-tailscale-derp
+```
+
+> **提示**：自有证书更新后，执行 `docker compose up -d --force-recreate` 重建容器以读取最新证书；自动证书由 DERP 申请与续期。
 
 ## 在 Tailscale 中配置
 
